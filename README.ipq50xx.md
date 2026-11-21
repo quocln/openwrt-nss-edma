@@ -456,11 +456,34 @@ configured.
 `nss-dwmac-probe` prints that view; `trunk`, `trunk_if`, `extra_ports` and
 `fw_mask` in uci still override it if a board needs that. First boot changes
 nothing about the wiring either: a board table that splits the DSA ports
-across both CPU links (the Redmi AX5400, the Cudy P5, the CMCC PZ-L8 and the
-CR880x put `lan1`-`lan3` on `eth1` and `wan` on `eth0`) is kept exactly as
+across both CPU links (the Redmi AX5400, the Cudy P5, the CMCC PZ-L8, the
+Redmi AX3000 ubootmod and the Xiaomi RA80 put `lan1`-`lan3` on `eth1` and
+`wan` on `eth0`) is kept exactly as
 `board.d` and netifd made it, and both links carry firmware traffic -
 `fw_mask` derives `0x3`, and `tag_8021q` hands a port's VLAN to its own CPU
 port alone, so neither link floods into the other.
+
+One bridge must not span both links. Under `qca-8021q` the bridge's VLAN then
+sits on both CPU ports: a flood the host sends on one link comes back on the
+other, and because the source port of a bridged frame is not known (imprecise
+RX) it is handed to a port of that bridge, so `br-lan` learns stations on the
+wrong port. A dumb AP that puts `wan` into `br-lan` on a split board shows it
+as Wi-Fi clients that now and again cannot reach wired hosts (reported on a
+CR8806; found by reading the code, not reproduced here). The Xiaomi CR8806
+therefore keeps all four ports on `eth1` in `board.d`: one link carries
+933 Mbit/s routed, as much as its 1 GbE WAN jack takes in one direction, and
+`fw_mask` derives `0x2`. A CR8806 that routes and wants the split (1104-1458
+Mbit/s both directions together) gets it with a conduit on `wan`; on the
+other split boards a dumb AP needs the same with `eth1`:
+
+```
+uci show network | grep "name='wan'"       # use that device section if one exists
+uci add network device
+uci set network.@device[-1].name='wan'
+uci set network.@device[-1].conduit='eth0'
+uci commit network
+reboot
+```
 
 Builds before 10 November 2026 consolidated such a split on first boot: every
 port was moved onto the link carrying most of them (`wan` to `eth1` on these

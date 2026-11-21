@@ -275,7 +275,10 @@
 			 * GMAC0 (eth0) behind it. board.d puts the wan port on this
 			 * conduit and leaves the lan ports on eth1, so a routed flow
 			 * crosses one conduit per direction instead of the same one
-			 * twice.
+			 * twice. The CR8806 is the exception: its board.d entry keeps
+			 * wan on eth1 as well, because a bridge that holds wan and
+			 * the lan ports must not span both conduits (see 02_network);
+			 * this port then stays idle until wan is given conduit eth0.
 			 *
 			 * This was disabled by a67d696c5d because the switch flooded
 			 * a standalone port's routed frames to both CPU ports, which

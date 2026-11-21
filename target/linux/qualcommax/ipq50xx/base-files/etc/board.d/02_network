@@ -65,7 +65,22 @@ ipq50xx_setup_interfaces()
 		ucidef_set_network_device_conduit "lan3" "eth1"
 		ucidef_set_network_device_conduit "wan" "eth0"
 		;;
-	xiaomi,cr8806|\
+	xiaomi,cr8806)
+		# All four ports on one CPU link. A bridge must not span both
+		# links: under qca-8021q its VLAN then sits on both CPU ports, a
+		# flood the host sends on one link comes back on the other, and
+		# imprecise RX hands it to a port of that bridge - br-lan learns
+		# stations on the wrong port. With wan in br-lan (a dumb AP) Wi-Fi
+		# clients then lose wired hosts now and again. One link carries
+		# 933 Mbit/s routed, as much as the 1 GbE WAN jack takes one way.
+		# A router that wants the split back sets conduit 'eth0' on wan
+		# in /etc/config/network (README.ipq50xx.md).
+		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
+		ucidef_set_network_device_conduit "lan1" "eth1"
+		ucidef_set_network_device_conduit "lan2" "eth1"
+		ucidef_set_network_device_conduit "lan3" "eth1"
+		ucidef_set_network_device_conduit "wan" "eth1"
+		;;
 	xiaomi,ra80|\
 	xiaomi,redmi-ax3000-ubootmod)
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
