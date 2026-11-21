@@ -1,0 +1,163 @@
+name: Build the Xiaomi CR8806 image
+
+# One board, one image set, kept as a workflow artifact:
+#   sysupgrade.bin        upgrade from a running OpenWrt of this tree
+#   factory.ubi           full slot image, written from the RAM-booted initramfs
+#   initramfs-uImage.itb  boots from RAM over TFTP (first install, or a trial run that leaves
+#                         the flash alone)
+# The config is .github/ci/ipq50xx/common.config + cr8806.config. No kmod repository is built,
+# so the image lists the official userspace feeds only: kernel modules of the official snapshot
+# target are built against another kernel configuration and must not be installed here.
+#
+# Runs by hand, or when a tag cr8806-* is pushed. A workflow that is not on the default branch
+# cannot be started by hand, so a build of another branch needs the tag.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'cr8806-*'
+
+concurrency:
+  group: build-cr8806
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TARGET: qualcommax/ipq50xx
+  CI_DIR: .github/ci/ipq50xx
+  DEVICE: xiaomi_cr8806
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y bzip2 g++ gawk gcc git glibc-source libncurses-dev make rsync
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # scripts/getver.sh derives the revision from history
+
+      - name: Feeds
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Package repositories for the image
+        run: |
+          set -euo pipefail
+          # The files/ overlay wins over the list FeedSourcesAppendAPK generates, which would
+          # name the official target repository and its kernel modules.
+          mkdir -p files/etc/apk/repositories.d
+          for f in base luci packages routing telephony video; do
+            echo "https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/${f}/packages.adb"
+          done >files/etc/apk/repositories.d/distfeeds.list
+          cat files/etc/apk/repositories.d/distfeeds.list
+
+      - name: Assemble .config
+        run: |
+          set -euo pipefail
+          frags=("${CI_DIR}/common.config" "${CI_DIR}/cr8806.config")
+          cat "${frags[@]}" >.config
+          make defconfig
+          # defconfig drops a symbol it cannot select without a word; here that is an error
+          dropped=()
+          while IFS= read -r req; do
+            grep -qxF "$req" .config || dropped+=("$req")
+          done < <(cat "${frags[@]}" | grep -E '^CONFIG_[A-Za-z0-9_-]+=' | sort -u)
+          if [[ ${#dropped[@]} -gt 0 ]]; then
+            printf '::error::defconfig dropped %s\n' "${dropped[@]}"
+            exit 1
+          fi
+          # and a package switched off in the fragments must not have come back into the image
+          back=()
+          while IFS= read -r off; do
+            grep -qxF "CONFIG_PACKAGE_${off}=y" .config && back+=("$off")
+          done < <(cat "${frags[@]}" | sed -n 's/^# CONFIG_PACKAGE_\(.*\) is not set$/\1/p')
+          if [[ ${#back[@]} -gt 0 ]]; then
+            printf '::error::%s is in the image again\n' "${back[@]}"
+            exit 1
+          fi
+          ./scripts/diffconfig.sh >diffconfig-cr8806.txt
+          cat diffconfig-cr8806.txt
+
+      - name: Download sources
+        timeout-minutes: 75
+        env:
+          GIT_HTTP_LOW_SPEED_LIMIT: 1000
+          GIT_HTTP_LOW_SPEED_TIME: 60
+          CURL_OPTIONS: --speed-limit 1000 --speed-time 60
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if timeout --kill-after=60 20m make download -j"$(nproc)"; then
+              exit 0
+            fi
+            echo "::warning::download attempt $attempt failed or ran into the 20 minute limit"
+            sleep 5
+          done
+          echo "::error::the sources could not be downloaded in three attempts"
+          exit 1
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if ! make -j"$(nproc)"; then
+            # the parallel log interleaves; a serial pass over what is left shows the failure
+            make -j1 V=s 2>&1 | tail -300
+            exit 1
+          fi
+          df -h / | tail -1
+
+      - name: Collect the images
+        run: |
+          set -euo pipefail
+          out="bin/targets/${TARGET}"
+          mkdir images
+          for kind in squashfs-sysupgrade.bin squashfs-factory.ubi initramfs-uImage.itb; do
+            f="$out/openwrt-qualcommax-ipq50xx-${DEVICE}-${kind}"
+            [[ -f "$f" ]] || { echo "::error::missing $(basename "$f")"; ls -la "$out"; exit 1; }
+            cp "$f" images/
+          done
+          cp "$out"/*.manifest "$out/config.buildinfo" diffconfig-cr8806.txt images/
+          # feeds.conf.default names the nss feed by branch, so record the feed commits used
+          ./scripts/feeds list -fs >images/feeds.buildinfo
+          (cd images && sha256sum openwrt-* >sha256sums)
+          # the things this build is for must be visible in the package list
+          if grep -Eq '^(kmod-usb|kmod-fs-ext4|e2fsprogs|losetup)' images/*.manifest; then
+            echo "::error::USB or ext4 packages are in the image"; exit 1
+          fi
+          grep -q '^luci ' images/*.manifest || { echo "::error::LuCI is not in the image"; exit 1; }
+          ls -la images
+          {
+            echo "## Xiaomi CR8806, built from \`${GITHUB_SHA::12}\`"
+            echo '```'
+            cat images/sha256sums
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the images
+        uses: actions/upload-artifact@v4
+        with:
+          name: cr8806-images
+          path: images/
+          retention-days: 30
+          if-no-files-found: error
