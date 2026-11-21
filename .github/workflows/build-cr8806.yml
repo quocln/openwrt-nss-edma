@@ -146,6 +146,12 @@ jobs:
             echo "::error::USB or ext4 packages are in the image"; exit 1
           fi
           grep -q '^luci ' images/*.manifest || { echo "::error::LuCI is not in the image"; exit 1; }
+          for pkg in wpad-mesh-mbedtls kmod-qca-nss-drv-wifi-meshmgr; do
+            grep -q "^${pkg} " images/*.manifest || { echo "::error::${pkg} is not in the image"; exit 1; }
+          done
+          if grep -q '^wpad-basic-mbedtls ' images/*.manifest; then
+            echo "::error::wpad-basic-mbedtls is in the image next to wpad-mesh-mbedtls"; exit 1
+          fi
           ls -la images
           {
             echo "## Xiaomi CR8806, built from \`${GITHUB_SHA::12}\`"
