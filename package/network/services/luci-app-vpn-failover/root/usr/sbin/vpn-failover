@@ -24,8 +24,10 @@
 #     steering is removed and the house is on the ISP connection 30 to 40 seconds later (three
 #     failed checks with the default settings); when it answers again, the steering comes back.
 #     WireGuard itself keeps retrying the server, so nothing has to be restarted.
-#   - DNS: the router asks the servers named in the file plus one public resolver, never the
-#     ISP's. While the tunnel is up those questions go through it as well.
+#   - DNS: while the tunnel answers, the router's own DNS questions are redirected to the DNS
+#     server of the VPN (the first IPv4 one named in its file) and go through the tunnel. The
+#     router's DNS settings are not changed, so while the tunnel does not answer it asks its
+#     normal servers again. "option vpn_dns '0'" keeps the normal servers all the time.
 #   - Devices that skip the VPN are matched by their LAN address, so each of them needs a fixed
 #     address (a static lease). They still ask the router for DNS like everybody else.
 #   - A VPN file without an IPv6 address: IPv6 from the LAN is refused while the tunnel is up,
@@ -33,7 +35,7 @@
 
 IFACE=wgvpn
 TABLE=100                 # the tunnel's own routing table
-FALLBACK_DNS=1.1.1.1      # answers while the tunnel (and a DNS server inside it) is down
+DNS_TABLE=vpn_failover    # the nftables table that redirects the router's DNS questions
 CFG=vpn-failover.main
 PROFILE_DIR=/etc/vpn-failover
 STATE_FILE=/var/run/vpn-failover.state
@@ -152,15 +154,7 @@ remove_tunnel() {
 	# The watchdog of the old tunnel goes first, so the state never names a VPN it is not
 	# watching; apply_changes starts the service again.
 	/etc/init.d/vpn-failover stop 2>/dev/null || true
-	# only the DNS setting this tool made, never one set by hand
-	if [ "$(cfg wan_dns_managed 0)" = 1 ]; then
-		uci -q delete network.wan.dns || true
-		for wan in wan wan6; do
-			uci -q get "network.$wan" >/dev/null || continue
-			uci -q delete "network.$wan.peerdns" || true
-		done
-	fi
-	for item in "$CFG.active" "$CFG.wan_dns_managed" "$CFG.dns" "network.$IFACE" "network.${IFACE}_peer" \
+	for item in "$CFG.active" "$CFG.dns" "network.$IFACE" "network.${IFACE}_peer" \
 		firewall.vpn_zone firewall.lan_to_vpn; do
 		uci -q delete "$item" || true
 	done
@@ -168,11 +162,6 @@ remove_tunnel() {
 
 write_tunnel() {
 	# write the tunnel of the file parse_conf has just read; the caller commits
-	DNS_ALL=''
-	for d in $(list_items "$DNS") $FALLBACK_DNS; do
-		case " $DNS_ALL " in *" $d "*) ;; *) DNS_ALL="${DNS_ALL:+$DNS_ALL }$d" ;; esac
-	done
-
 	# the tunnel, with its routes in a table of its own
 	uci set "network.$IFACE=interface"
 	uci set "network.$IFACE.proto=wireguard"
@@ -192,20 +181,11 @@ write_tunnel() {
 	uci set "network.${IFACE}_peer.route_allowed_ips=1"
 	for n in $(list_items "$ALLOWED_IPS"); do uci add_list "network.${IFACE}_peer.allowed_ips=$n"; done
 
-	# DNS: the file's servers and the fallback, in place of the ISP's
-	if [ -z "$(uci -q get network.wan.dns)" ]; then
-		uci set "$CFG.wan_dns_managed=1"
-		for d in $DNS_ALL; do
-			uci add_list "network.wan.dns=$d"
-			uci add_list "$CFG.dns=$d"
-		done
-		for wan in wan wan6; do
-			uci -q get "network.$wan" >/dev/null || continue
-			uci set "network.$wan.peerdns=0"
-		done
-	else
-		echo "note: network.wan.dns is already set by hand and is left alone; the DNS servers of the file are not used" >&2
-	fi
+	# the VPN's own DNS servers, for the watchdog: it redirects the router's questions to the
+	# first one, over IPv4
+	for d in $(list_items "$DNS"); do
+		case "$d" in *:*) ;; *) uci add_list "$CFG.dns=$d" ;; esac
+	done
 
 	# firewall: the LAN may go out through the tunnel as well as through the WAN
 	uci set firewall.vpn_zone=zone
@@ -302,9 +282,11 @@ do_status() {
 	json_add_string active "$(cfg active)"
 	json_add_boolean running "$running"
 	if [ "$running" = 1 ] && [ -r "$STATE_FILE" ]; then
-		read -r state since <"$STATE_FILE"
+		read -r state since dns <"$STATE_FILE"
 		json_add_string state "$state"
 		json_add_int since "$since"
+		# the DNS server of the VPN the router's questions go to now, empty for its normal ones
+		json_add_string dns "$dns"
 	fi
 	# seconds since 1970 of the last handshake with the server, 0 for none yet
 	handshake="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')"
@@ -328,7 +310,7 @@ do_status() {
 PRIO_PROBE=970       # the watchdog's own pings, always through the tunnel
 PRIO_PROBE_ONLY=971  # ... and nowhere else: see probe_rules
 PRIO_DIRECT=975      # devices that skip the VPN keep the normal route
-PRIO_DNS=980         # the router's DNS questions, through the tunnel while it is up
+PRIO_DNS=980         # the VPN's DNS server is reached through the tunnel while it is up
 PRIO_LOCAL=990       # private networks (the modem's page, other LANs) keep their normal route
 PRIO_LAN=1000        # everything else that comes in from the LAN
 
@@ -356,7 +338,7 @@ probe_rules() {
 steer() {
 	# steer <add|del>: the rules that put the house into the tunnel
 	for i in $DIRECT_IPS; do rule 4 "$1" from "$i" lookup main priority "$PRIO_DIRECT"; done
-	for d in $DNS_V4; do rule 4 "$1" to "$d" lookup "$TABLE" priority "$PRIO_DNS"; done
+	[ -z "$VPN_DNS" ] || rule 4 "$1" to "$VPN_DNS" lookup "$TABLE" priority "$PRIO_DNS"
 	for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
 		rule 4 "$1" to "$n" lookup main priority "$PRIO_LOCAL"
 	done
@@ -364,7 +346,6 @@ steer() {
 
 	for n in fc00::/7 fe80::/10; do rule 6 "$1" to "$n" lookup main priority "$PRIO_LOCAL"; done
 	if [ "$TUNNEL_V6" = 1 ]; then
-		for d in $DNS_V6; do rule 6 "$1" to "$d" lookup "$TABLE" priority "$PRIO_DNS"; done
 		rule 6 "$1" iif "$LAN_DEV" lookup "$TABLE" priority "$PRIO_LAN"
 	else
 		# the tunnel carries no IPv6: refuse it rather than let it pass around the VPN
@@ -372,10 +353,40 @@ steer() {
 	fi
 }
 
+dns_redirect() {
+	# dns_redirect <add|del>: send the router's own DNS questions to the VPN's DNS server instead
+	# of the servers it is configured with. The questions are rewritten on their way out, so
+	# dnsmasq and the router's DNS settings stay as they are, and deleting the table is all it
+	# takes to be back on the normal servers. Questions over IPv6 are refused meanwhile: they
+	# cannot be rewritten to an IPv4 server, and dnsmasq then asks over IPv4.
+	nft delete table inet "$DNS_TABLE" 2>/dev/null
+	ACTIVE_DNS=''
+	if [ "$1" = add ] && [ -n "$VPN_DNS" ]; then
+		nft -f - <<-EOF && ACTIVE_DNS="$VPN_DNS"
+			table inet $DNS_TABLE {
+				chain to_vpn_dns {
+					type nat hook output priority -100; policy accept;
+					meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 fib daddr type != local dnat ip to $VPN_DNS
+				}
+				chain no_ipv6_dns {
+					type filter hook output priority 0; policy accept;
+					meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr type != local reject
+				}
+			}
+		EOF
+		[ -n "$ACTIVE_DNS" ] || log "the DNS questions could not be redirected to $VPN_DNS: the router keeps its normal DNS servers"
+	fi
+	# answers kept from the other servers would hide the change
+	killall -HUP dnsmasq 2>/dev/null
+	return 0
+}
+
 forget_connections() {
-	# connections opened on the other path would hang until they time out
-	# the braces keep a refused write quiet as well: the shell reports that one itself
-	[ -w /proc/net/nf_conntrack ] && { echo f >/proc/net/nf_conntrack; } 2>/dev/null
+	# Connections opened on the other path would hang until they time out, and a DNS question
+	# the router repeats would keep going to the server of before. An OpenWrt kernel empties its
+	# connection table on this write; on another kernel the conntrack tool does, if it is there.
+	# The braces keep a refused write quiet as well: the shell reports that one itself.
+	{ echo f >/proc/net/nf_conntrack; } 2>/dev/null || conntrack -F >/dev/null 2>&1
 	[ -w /sys/kernel/debug/ecm/ecm_db/defunct_all ] && { echo 1 >/sys/kernel/debug/ecm/ecm_db/defunct_all; } 2>/dev/null
 	return 0
 }
@@ -391,10 +402,11 @@ set_state() {
 	# starting: no answer yet since the watchdog started; up: steered into the tunnel;
 	# down: the tunnel does not answer
 	state="$1"
-	echo "$state $(date +%s)" >"$STATE_FILE"
+	echo "$state $(date +%s) $ACTIVE_DNS" >"$STATE_FILE"
 }
 
 stop_watchdog() {
+	dns_redirect del
 	steer del
 	probe_rules del
 	forget_connections
@@ -414,14 +426,9 @@ do_run() {
 	done
 	[ -n "$PROBE_SRC" ] || die "No VPN is in use: there is nothing to watch."
 
-	DNS_V4=''
-	DNS_V6=''
-	for d in $(cfg dns); do
-		case "$d" in
-		*:*) DNS_V6="${DNS_V6:+$DNS_V6 }$d" ;;
-		*) DNS_V4="${DNS_V4:+$DNS_V4 }$d" ;;
-		esac
-	done
+	# the DNS server of the VPN, unless the setting says to keep the normal ones
+	VPN_DNS=''
+	[ "$(cfg vpn_dns 1)" != 1 ] || VPN_DNS="$(cfg dns | cut -d ' ' -f 1)"
 	LAN_DEV="$(uci -q get network.lan.device || echo br-lan)"
 	DIRECT_IPS="$(cfg direct_ip)"
 	PROBE_TARGETS="$(cfg probe_target '1.1.1.1 8.8.8.8')"   # one answer is enough
@@ -433,6 +440,7 @@ do_run() {
 
 	probe_rules add
 	steer del
+	dns_redirect del
 	set_state starting
 	good=0
 	bad=0
@@ -448,10 +456,12 @@ do_run() {
 		fi
 		if [ "$state" != up ] && [ "$good" -ge "$UP_AFTER" ]; then
 			steer add
+			dns_redirect add
 			forget_connections
 			set_state up
 			log "the tunnel answers: the house goes through the VPN"
 		elif [ "$state" = up ] && [ "$bad" -ge "$DOWN_AFTER" ]; then
+			dns_redirect del
 			steer del
 			forget_connections
 			set_state down

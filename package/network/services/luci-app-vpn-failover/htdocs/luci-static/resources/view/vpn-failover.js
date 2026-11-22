@@ -124,7 +124,10 @@ function renderBanner(st) {
 		break;
 	case 'up':
 		title = _('Connected to %s').format(name);
-		sub = _('All devices go through this VPN. Connected for %s.').format(duration(st.now - st.since));
+		sub = (st.dns
+			? _('All devices go through this VPN, and the router looks names up at its DNS server %s.').format(st.dns)
+			: _('All devices go through this VPN. The router looks names up at its normal DNS servers.'))
+			+ ' ' + _('Connected for %s.').format(duration(st.now - st.since));
 		break;
 	case 'down':
 		title = _('%s is not responding').format(name);
@@ -383,6 +386,8 @@ return view.extend({
 		s.addremove = false;
 		s.tab('devices', _('Devices that skip the VPN'),
 			_('Devices listed here always use the normal internet connection, also while a VPN is connected. Useful for a device that does not work through a VPN.'));
+		s.tab('dns', _('DNS'),
+			_('DNS turns names such as example.com into addresses. Devices ask the router, and the router asks a DNS server.'));
 		s.tab('advanced', _('Advanced'),
 			_('How the router decides that the VPN has stopped working. The values it comes with suit most connections.'));
 
@@ -396,6 +401,11 @@ return view.extend({
 					o.value(ip, '%s (%s)'.format(host.name || L.toArray(host.mac).join(' ') || '?', ip));
 			});
 		});
+
+		o = s.taboption('dns', form.Flag, 'vpn_dns', _('Use the DNS server of the VPN'),
+			_('On: while a VPN is connected, the router asks the DNS server named in that VPN’s file, through the VPN. Off: the router keeps asking its normal DNS servers, so your internet provider can still see which names are looked up. While no VPN is connected the router always uses its normal DNS servers.'));
+		o.default = '1';
+		o.rmempty = false;
 
 		o = s.taboption('advanced', form.DynamicList, 'probe_target', _('Test addresses'),
 			_('Internet addresses the router pings through the VPN. The VPN counts as working while at least one of them replies.'));

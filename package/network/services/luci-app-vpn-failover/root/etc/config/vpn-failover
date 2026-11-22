@@ -8,6 +8,8 @@ config failover 'main'
 	# pinged through the tunnel; one answer is enough
 	list probe_target '1.1.1.1'
 	list probe_target '8.8.8.8'
+	# 1: while a VPN is connected the router asks that VPN's DNS server; 0: always its normal ones
+	option vpn_dns '1'
 	# LAN addresses of devices that always use the ISP connection:
 	# list direct_ip '192.168.7.50'
 
