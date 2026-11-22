@@ -1,0 +1,15 @@
+config failover 'main'
+	# seconds between two checks of the tunnel
+	option interval '10'
+	# failed checks in a row before the house falls back to the ISP connection
+	option down_after '3'
+	# good checks in a row before it goes into the tunnel
+	option up_after '2'
+	# pinged through the tunnel; one answer is enough
+	list probe_target '1.1.1.1'
+	list probe_target '8.8.8.8'
+	# LAN addresses of devices that always use the ISP connection:
+	# list direct_ip '192.168.7.50'
+
+# "option active" names the VPN in use, one of the files /etc/vpn-failover/vpn<N>.conf that
+# "vpn-failover add <file>" (or the LuCI page VPN, House VPN) keeps. Set by "vpn-failover use".

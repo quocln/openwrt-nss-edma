@@ -1,0 +1,20 @@
+{
+	"luci-app-vpn-failover": {
+		"description": "Grant access to the whole-house VPN with fallback",
+		"read": {
+			"file": {
+				"/usr/sbin/vpn-failover status": [ "exec" ]
+			},
+			"uci": [ "vpn-failover", "dhcp" ]
+		},
+		"write": {
+			"file": {
+				"/tmp/vpn-failover-import.conf": [ "write" ],
+				"/usr/sbin/vpn-failover add /tmp/vpn-failover-import.conf": [ "exec" ],
+				"/usr/sbin/vpn-failover use *": [ "exec" ],
+				"/usr/sbin/vpn-failover delete *": [ "exec" ]
+			},
+			"uci": [ "vpn-failover" ]
+		}
+	}
+}

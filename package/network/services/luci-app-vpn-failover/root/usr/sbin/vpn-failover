@@ -1,0 +1,475 @@
+#!/bin/sh
+# Send the whole house through one WireGuard VPN out of several, and fall back to the plain ISP
+# connection by itself while that VPN does not answer. For the MAIN router (the one with the WAN
+# cable); access points behind it just bridge, so their clients follow automatically.
+#
+#   vpn-failover add <file>      keep a WireGuard client file of a VPN provider as one more VPN.
+#                                A line "# Name = ..." in it names the VPN. The file holds the
+#                                private key: it is DELETED afterwards, whether it was taken
+#                                or not. The first VPN added is put to use at once.
+#   vpn-failover use <id>        send the house through that VPN (one at a time)
+#   vpn-failover use none        no VPN: the house uses the ISP connection
+#   vpn-failover delete <id>     forget that VPN
+#   vpn-failover status          the VPNs and the state as JSON (read by the LuCI page VPN)
+#   vpn-failover run             the watchdog; /etc/init.d/vpn-failover starts it
+#
+# The devices that skip the VPN and the way the watchdog checks the tunnel are settings in
+# /etc/config/vpn-failover. The VPNs are their files, kept in /etc/vpn-failover as vpn<N>.conf.
+#
+# How it works:
+#   - Only the VPN in use has a tunnel, "wgvpn". It keeps its routes in a routing table of its
+#     own, so the router's normal routes (the ISP connection) are never touched.
+#   - The watchdog pings through the tunnel every few seconds. While the tunnel answers, traffic
+#     coming in from the LAN is steered into the tunnel's table. When it stops answering, the
+#     steering is removed and the house is on the ISP connection 30 to 40 seconds later (three
+#     failed checks with the default settings); when it answers again, the steering comes back.
+#     WireGuard itself keeps retrying the server, so nothing has to be restarted.
+#   - DNS: the router asks the servers named in the file plus one public resolver, never the
+#     ISP's. While the tunnel is up those questions go through it as well.
+#   - Devices that skip the VPN are matched by their LAN address, so each of them needs a fixed
+#     address (a static lease). They still ask the router for DNS like everybody else.
+#   - A VPN file without an IPv6 address: IPv6 from the LAN is refused while the tunnel is up,
+#     so nothing slips past the VPN over IPv6. Devices then simply use IPv4.
+
+IFACE=wgvpn
+TABLE=100                 # the tunnel's own routing table
+FALLBACK_DNS=1.1.1.1      # answers while the tunnel (and a DNS server inside it) is down
+CFG=vpn-failover.main
+PROFILE_DIR=/etc/vpn-failover
+STATE_FILE=/var/run/vpn-failover.state
+PID_FILE=/var/run/vpn-failover.pid
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+usage() {
+	sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+	exit 1
+}
+
+cfg() {
+	# cfg <option> [default]
+	uci -q get "$CFG.$1" || echo "${2:-}"
+}
+
+list_items() {
+	# "a, b ,c" -> one item per line
+	echo "$1" | tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -v '^$' || true
+}
+
+# --- the VPNs: add, use, delete -------------------------------------------------------------------
+
+conf_get() {
+	# conf_get <section> <key>: first value of the key in that section, both lower case
+	awk -v sec="$1" -v key="$2" '
+		/^[ \t]*\[/ {
+			cur = tolower($0)
+			sub(/^[ \t]*\[[ \t]*/, "", cur)
+			sub(/[ \t]*\].*$/, "", cur)
+			seen[cur]++
+			next
+		}
+		/^[ \t]*[#;]/ { next }
+		cur == sec && seen[cur] == 1 {
+			line = $0
+			sub(/\r$/, "", line)
+			i = index(line, "=")
+			if (!i)
+				next
+			k = tolower(substr(line, 1, i - 1))
+			gsub(/[ \t]/, "", k)
+			v = substr(line, i + 1)
+			sub(/^[ \t]+/, "", v)
+			sub(/[ \t]+$/, "", v)
+			if (k == key) {
+				print v
+				exit
+			}
+		}' "$CONF"
+}
+
+parse_conf() {
+	# parse_conf <file>: read a WireGuard client file into variables, or die saying what is wrong
+	CONF="$1"
+	[ -r "$CONF" ] || die "cannot read $CONF"
+	[ "$(grep -ci '^[ \t]*\[peer\]' "$CONF")" = 1 ] || die "the file must have exactly one [Peer] section"
+
+	PRIVATE_KEY="$(conf_get interface privatekey)"
+	ADDRESSES="$(conf_get interface address)"
+	DNS="$(conf_get interface dns)"
+	MTU="$(conf_get interface mtu)"
+	PUBLIC_KEY="$(conf_get peer publickey)"
+	PRESHARED_KEY="$(conf_get peer presharedkey)"
+	ENDPOINT="$(conf_get peer endpoint)"
+	ALLOWED_IPS="$(conf_get peer allowedips)"
+	KEEPALIVE="$(conf_get peer persistentkeepalive)"
+
+	[ -n "$PRIVATE_KEY" ] || die "no PrivateKey in [Interface]"
+	[ -n "$ADDRESSES" ] || die "no Address in [Interface]"
+	[ -n "$PUBLIC_KEY" ] || die "no PublicKey in [Peer]"
+	[ -n "$ENDPOINT" ] || die "no Endpoint in [Peer]"
+	[ -n "$ALLOWED_IPS" ] || die "no AllowedIPs in [Peer]"
+
+	# host:port, or [v6 address]:port
+	ENDPOINT_PORT="${ENDPOINT##*:}"
+	ENDPOINT_HOST="${ENDPOINT%:*}"
+	ENDPOINT_HOST="${ENDPOINT_HOST#[}"
+	ENDPOINT_HOST="${ENDPOINT_HOST%]}"
+	case "$ENDPOINT_PORT" in
+	'' | *[!0-9]*) die "cannot read the port of Endpoint '$ENDPOINT'" ;;
+	esac
+	[ -n "$ENDPOINT_HOST" ] || die "cannot read the host of Endpoint '$ENDPOINT'"
+
+	# the watchdog pings from the tunnel's own IPv4 address
+	HAS_V4=0
+	for a in $(list_items "$ADDRESSES"); do
+		case "$a" in *:*) ;; *) HAS_V4=1 ;; esac
+	done
+	[ "$HAS_V4" = 1 ] || die "no IPv4 Address in [Interface]: the watchdog needs one to ping from"
+}
+
+is_profile() {
+	# an id is "vpn" and a number, nothing that could name another file
+	case "$1" in
+	'' | *[!a-z0-9]*) return 1 ;;
+	vpn[0-9]*) [ -f "$PROFILE_DIR/$1.conf" ] ;;
+	*) return 1 ;;
+	esac
+}
+
+profile_name() {
+	# profile_name <file>: its "# Name = ..." comment, one line of text without control characters
+	sed -n 's/^[ \t]*#[ \t]*[Nn]ame[ \t]*=[ \t]*//p' "$1" | head -n 1 | tr -d '\000-\037' | cut -c 1-120
+}
+
+remove_tunnel() {
+	# take the tunnel in use out of the configuration; the caller commits.
+	# The watchdog of the old tunnel goes first, so the state never names a VPN it is not
+	# watching; apply_changes starts the service again.
+	/etc/init.d/vpn-failover stop 2>/dev/null || true
+	# only the DNS setting this tool made, never one set by hand
+	if [ "$(cfg wan_dns_managed 0)" = 1 ]; then
+		uci -q delete network.wan.dns || true
+		for wan in wan wan6; do
+			uci -q get "network.$wan" >/dev/null || continue
+			uci -q delete "network.$wan.peerdns" || true
+		done
+	fi
+	for item in "$CFG.active" "$CFG.wan_dns_managed" "$CFG.dns" "network.$IFACE" "network.${IFACE}_peer" \
+		firewall.vpn_zone firewall.lan_to_vpn; do
+		uci -q delete "$item" || true
+	done
+}
+
+write_tunnel() {
+	# write the tunnel of the file parse_conf has just read; the caller commits
+	DNS_ALL=''
+	for d in $(list_items "$DNS") $FALLBACK_DNS; do
+		case " $DNS_ALL " in *" $d "*) ;; *) DNS_ALL="${DNS_ALL:+$DNS_ALL }$d" ;; esac
+	done
+
+	# the tunnel, with its routes in a table of its own
+	uci set "network.$IFACE=interface"
+	uci set "network.$IFACE.proto=wireguard"
+	uci set "network.$IFACE.private_key=$PRIVATE_KEY"
+	uci set "network.$IFACE.ip4table=$TABLE"
+	uci set "network.$IFACE.ip6table=$TABLE"
+	[ -z "$MTU" ] || uci set "network.$IFACE.mtu=$MTU"
+	for a in $(list_items "$ADDRESSES"); do uci add_list "network.$IFACE.addresses=$a"; done
+
+	uci set "network.${IFACE}_peer=wireguard_$IFACE"
+	uci set "network.${IFACE}_peer.description=vpn"
+	uci set "network.${IFACE}_peer.public_key=$PUBLIC_KEY"
+	[ -z "$PRESHARED_KEY" ] || uci set "network.${IFACE}_peer.preshared_key=$PRESHARED_KEY"
+	uci set "network.${IFACE}_peer.endpoint_host=$ENDPOINT_HOST"
+	uci set "network.${IFACE}_peer.endpoint_port=$ENDPOINT_PORT"
+	uci set "network.${IFACE}_peer.persistent_keepalive=${KEEPALIVE:-25}"
+	uci set "network.${IFACE}_peer.route_allowed_ips=1"
+	for n in $(list_items "$ALLOWED_IPS"); do uci add_list "network.${IFACE}_peer.allowed_ips=$n"; done
+
+	# DNS: the file's servers and the fallback, in place of the ISP's
+	if [ -z "$(uci -q get network.wan.dns)" ]; then
+		uci set "$CFG.wan_dns_managed=1"
+		for d in $DNS_ALL; do
+			uci add_list "network.wan.dns=$d"
+			uci add_list "$CFG.dns=$d"
+		done
+		for wan in wan wan6; do
+			uci -q get "network.$wan" >/dev/null || continue
+			uci set "network.$wan.peerdns=0"
+		done
+	else
+		echo "note: network.wan.dns is already set by hand and is left alone; the DNS servers of the file are not used" >&2
+	fi
+
+	# firewall: the LAN may go out through the tunnel as well as through the WAN
+	uci set firewall.vpn_zone=zone
+	uci set firewall.vpn_zone.name=vpn
+	uci add_list "firewall.vpn_zone.network=$IFACE"
+	uci set firewall.vpn_zone.input=REJECT
+	uci set firewall.vpn_zone.output=ACCEPT
+	uci set firewall.vpn_zone.forward=REJECT
+	uci set firewall.vpn_zone.masq=1
+	uci set firewall.vpn_zone.mtu_fix=1
+
+	uci set firewall.lan_to_vpn=forwarding
+	uci set firewall.lan_to_vpn.src=lan
+	uci set firewall.lan_to_vpn.dest=vpn
+}
+
+apply_changes() {
+	uci commit network
+	uci commit firewall
+	uci commit vpn-failover
+	# netifd and the firewall pick their part up
+	reload_config
+	# A stopped service is gone from procd, with the triggers that would reload it: start it
+	# again. It runs the watchdog if a tunnel is configured and waits for changes if not.
+	/etc/init.d/vpn-failover start 2>/dev/null || true
+}
+
+do_use() {
+	if [ "$1" = none ]; then
+		remove_tunnel
+		apply_changes
+		echo "No VPN: the house uses the ISP connection."
+		return 0
+	fi
+
+	is_profile "$1" || die "there is no VPN '$1'"
+	uci -q get network.wan >/dev/null || die "this router has no wan interface: this belongs on the main router"
+	uci -q get network.lan >/dev/null || die "this router has no lan interface"
+	[ -f /etc/config/firewall ] || die "no firewall configuration on this router"
+	parse_conf "$PROFILE_DIR/$1.conf"
+
+	# from here on the configuration is written: a failed step stops before the commit
+	set -e
+	remove_tunnel
+	write_tunnel
+	uci set "$CFG.active=$1"
+	apply_changes
+	echo "The house now uses $(profile_name "$PROFILE_DIR/$1.conf"), with fallback to the ISP connection."
+}
+
+do_add() {
+	# the file holds the private key: it goes whatever happens below
+	NEW_FILE="$1"
+	trap 'rm -f "$NEW_FILE"' EXIT
+	parse_conf "$NEW_FILE"
+
+	n=1
+	while [ -e "$PROFILE_DIR/vpn$n.conf" ]; do n=$((n + 1)); done
+	id="vpn$n"
+	name="$(profile_name "$NEW_FILE")"
+	[ -n "$name" ] || name="VPN $n"
+
+	# the kept file starts with the name, so the name is always there to read
+	mkdir -p "$PROFILE_DIR" && chmod 700 "$PROFILE_DIR" &&
+		(umask 077 && { echo "# Name = $name"; cat "$NEW_FILE"; } >"$PROFILE_DIR/$id.conf") ||
+		die "cannot keep the file in $PROFILE_DIR"
+	echo "Added $name."
+
+	# nothing in use yet: the first VPN is what the house uses
+	[ -n "$(cfg active)" ] || do_use "$id"
+}
+
+do_delete() {
+	is_profile "$1" || die "there is no VPN '$1'"
+	rm -f "$PROFILE_DIR/$1.conf"
+	# a VPN that is not in use is only its file: the one in use is left running
+	if [ "$(cfg active)" = "$1" ]; then
+		remove_tunnel
+		apply_changes
+	fi
+	echo "Deleted."
+}
+
+# --- status --------------------------------------------------------------------------------------
+
+do_status() {
+	. /usr/share/libubox/jshn.sh
+	running=0
+	[ -r "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null && running=1
+
+	json_init
+	json_add_int now "$(date +%s)"
+	json_add_string active "$(cfg active)"
+	json_add_boolean running "$running"
+	if [ "$running" = 1 ] && [ -r "$STATE_FILE" ]; then
+		read -r state since <"$STATE_FILE"
+		json_add_string state "$state"
+		json_add_int since "$since"
+	fi
+	# seconds since 1970 of the last handshake with the server, 0 for none yet
+	handshake="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')"
+	json_add_int handshake "${handshake:-0}"
+	json_add_array profiles
+	for CONF in "$PROFILE_DIR"/vpn*.conf; do
+		[ -f "$CONF" ] || continue
+		id="${CONF##*/}"
+		json_add_object
+		json_add_string id "${id%.conf}"
+		json_add_string name "$(profile_name "$CONF")"
+		json_add_string endpoint "$(conf_get peer endpoint)"
+		json_close_object
+	done
+	json_close_array
+	json_dump
+}
+
+# --- the watchdog --------------------------------------------------------------------------------
+
+PRIO_PROBE=970       # the watchdog's own pings, always through the tunnel
+PRIO_PROBE_ONLY=971  # ... and nowhere else: see probe_rules
+PRIO_DIRECT=975      # devices that skip the VPN keep the normal route
+PRIO_DNS=980         # the router's DNS questions, through the tunnel while it is up
+PRIO_LOCAL=990       # private networks (the modem's page, other LANs) keep their normal route
+PRIO_LAN=1000        # everything else that comes in from the LAN
+
+log() {
+	logger -s -t vpn-failover "$*"
+}
+
+rule() {
+	# rule <4|6> <add|del> <rule...>; "del" removes every copy, "add" leaves exactly one
+	fam="$1"
+	act="$2"
+	shift 2
+	while ip "-$fam" rule del "$@" 2>/dev/null; do :; done
+	[ "$act" = del ] || ip "-$fam" rule add "$@"
+}
+
+probe_rules() {
+	# probe_rules <add|del>: packets from the tunnel's address use the tunnel's table and nothing
+	# else. Without the second rule a ping the tunnel's table has no route for would fall through
+	# to the ISP connection, be masqueraded there and come back: a dead tunnel that "answers".
+	rule 4 "$1" from "$PROBE_SRC" lookup "$TABLE" priority "$PRIO_PROBE"
+	rule 4 "$1" from "$PROBE_SRC" type unreachable priority "$PRIO_PROBE_ONLY"
+}
+
+steer() {
+	# steer <add|del>: the rules that put the house into the tunnel
+	for i in $DIRECT_IPS; do rule 4 "$1" from "$i" lookup main priority "$PRIO_DIRECT"; done
+	for d in $DNS_V4; do rule 4 "$1" to "$d" lookup "$TABLE" priority "$PRIO_DNS"; done
+	for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+		rule 4 "$1" to "$n" lookup main priority "$PRIO_LOCAL"
+	done
+	rule 4 "$1" iif "$LAN_DEV" lookup "$TABLE" priority "$PRIO_LAN"
+
+	for n in fc00::/7 fe80::/10; do rule 6 "$1" to "$n" lookup main priority "$PRIO_LOCAL"; done
+	if [ "$TUNNEL_V6" = 1 ]; then
+		for d in $DNS_V6; do rule 6 "$1" to "$d" lookup "$TABLE" priority "$PRIO_DNS"; done
+		rule 6 "$1" iif "$LAN_DEV" lookup "$TABLE" priority "$PRIO_LAN"
+	else
+		# the tunnel carries no IPv6: refuse it rather than let it pass around the VPN
+		rule 6 "$1" iif "$LAN_DEV" type prohibit priority "$PRIO_LAN"
+	fi
+}
+
+forget_connections() {
+	# connections opened on the other path would hang until they time out
+	# the braces keep a refused write quiet as well: the shell reports that one itself
+	[ -w /proc/net/nf_conntrack ] && { echo f >/proc/net/nf_conntrack; } 2>/dev/null
+	[ -w /sys/kernel/debug/ecm/ecm_db/defunct_all ] && { echo 1 >/sys/kernel/debug/ecm/ecm_db/defunct_all; } 2>/dev/null
+	return 0
+}
+
+tunnel_answers() {
+	for t in $PROBE_TARGETS; do
+		ping -c 1 -W 2 -I "$PROBE_SRC" "$t" >/dev/null 2>&1 && return 0
+	done
+	return 1
+}
+
+set_state() {
+	# starting: no answer yet since the watchdog started; up: steered into the tunnel;
+	# down: the tunnel does not answer
+	state="$1"
+	echo "$state $(date +%s)" >"$STATE_FILE"
+}
+
+stop_watchdog() {
+	steer del
+	probe_rules del
+	forget_connections
+	rm -f "$STATE_FILE"
+	log "stopped: the house is on the ISP connection"
+	exit 0
+}
+
+do_run() {
+	PROBE_SRC=''
+	TUNNEL_V6=0
+	for a in $(uci -q get "network.$IFACE.addresses"); do
+		case "$a" in
+		*:*) TUNNEL_V6=1 ;;
+		*) [ -n "$PROBE_SRC" ] || PROBE_SRC="${a%/*}" ;;
+		esac
+	done
+	[ -n "$PROBE_SRC" ] || die "no VPN is in use"
+
+	DNS_V4=''
+	DNS_V6=''
+	for d in $(cfg dns); do
+		case "$d" in
+		*:*) DNS_V6="${DNS_V6:+$DNS_V6 }$d" ;;
+		*) DNS_V4="${DNS_V4:+$DNS_V4 }$d" ;;
+		esac
+	done
+	LAN_DEV="$(uci -q get network.lan.device || echo br-lan)"
+	DIRECT_IPS="$(cfg direct_ip)"
+	PROBE_TARGETS="$(cfg probe_target '1.1.1.1 8.8.8.8')"   # one answer is enough
+	INTERVAL="$(cfg interval 10)"       # seconds between two checks
+	DOWN_AFTER="$(cfg down_after 3)"    # failed checks in a row before the house falls back
+	UP_AFTER="$(cfg up_after 2)"        # good checks in a row before it goes into the tunnel
+
+	trap stop_watchdog INT TERM
+
+	probe_rules add
+	steer del
+	set_state starting
+	good=0
+	bad=0
+	log "started: on the ISP connection until the tunnel answers"
+
+	while :; do
+		if tunnel_answers; then
+			good=$((good + 1))
+			bad=0
+		else
+			bad=$((bad + 1))
+			good=0
+		fi
+		if [ "$state" != up ] && [ "$good" -ge "$UP_AFTER" ]; then
+			steer add
+			forget_connections
+			set_state up
+			log "the tunnel answers: the house goes through the VPN"
+		elif [ "$state" = up ] && [ "$bad" -ge "$DOWN_AFTER" ]; then
+			steer del
+			forget_connections
+			set_state down
+			log "the tunnel does not answer: the house is back on the ISP connection"
+		elif [ "$state" = starting ] && [ "$bad" -ge "$DOWN_AFTER" ]; then
+			set_state down
+			log "the tunnel has not answered since the start: the house stays on the ISP connection"
+		fi
+		# right after a VPN was chosen, check quickly: the house should not wait for it
+		if [ "$state" = starting ]; then sleep 2 & else sleep "$INTERVAL" & fi
+		wait $!
+	done
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"
+shift
+case "$cmd $#" in
+"add 1") do_add "$1" ;;
+"use 1") do_use "$1" ;;
+"delete 1") do_delete "$1" ;;
+"status 0") do_status ;;
+"run 0") do_run ;;
+*) usage ;;
+esac

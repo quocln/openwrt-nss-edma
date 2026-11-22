@@ -1,0 +1,26 @@
+#!/bin/sh /etc/rc.common
+# The whole-house VPN watchdog, see /usr/sbin/vpn-failover.
+
+START=99
+USE_PROCD=1
+
+start_service() {
+	# nothing to watch while no VPN is in use
+	uci -q get network.wgvpn >/dev/null || return 0
+
+	procd_open_instance
+	procd_set_param command /usr/sbin/vpn-failover run
+	procd_set_param pidfile /var/run/vpn-failover.pid
+	procd_set_param respawn
+	procd_close_instance
+}
+
+# the watchdog reads its settings once, when it starts
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger vpn-failover network
+}
