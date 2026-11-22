@@ -94,7 +94,9 @@ parse_conf() {
 	# parse_conf <file>: read a WireGuard client file into variables, or die saying what is wrong
 	CONF="$1"
 	[ -r "$CONF" ] || die "cannot read $CONF"
-	[ "$(grep -ci '^[ \t]*\[peer\]' "$CONF")" = 1 ] || die "the file must have exactly one [Peer] section"
+	peers="$(grep -ci '^[ \t]*\[peer\]' "$CONF")"
+	[ "$peers" != 0 ] || die "This is not a WireGuard client file: it has no [Peer] section."
+	[ "$peers" = 1 ] || die "This file has $peers [Peer] sections. A client file of a VPN provider has exactly one."
 
 	PRIVATE_KEY="$(conf_get interface privatekey)"
 	ADDRESSES="$(conf_get interface address)"
@@ -106,11 +108,12 @@ parse_conf() {
 	ALLOWED_IPS="$(conf_get peer allowedips)"
 	KEEPALIVE="$(conf_get peer persistentkeepalive)"
 
-	[ -n "$PRIVATE_KEY" ] || die "no PrivateKey in [Interface]"
-	[ -n "$ADDRESSES" ] || die "no Address in [Interface]"
-	[ -n "$PUBLIC_KEY" ] || die "no PublicKey in [Peer]"
-	[ -n "$ENDPOINT" ] || die "no Endpoint in [Peer]"
-	[ -n "$ALLOWED_IPS" ] || die "no AllowedIPs in [Peer]"
+	incomplete="This is not a complete WireGuard client file:"
+	[ -n "$PRIVATE_KEY" ] || die "$incomplete PrivateKey is missing from [Interface]."
+	[ -n "$ADDRESSES" ] || die "$incomplete Address is missing from [Interface]."
+	[ -n "$PUBLIC_KEY" ] || die "$incomplete PublicKey is missing from [Peer]."
+	[ -n "$ENDPOINT" ] || die "$incomplete Endpoint is missing from [Peer]."
+	[ -n "$ALLOWED_IPS" ] || die "$incomplete AllowedIPs is missing from [Peer]."
 
 	# host:port, or [v6 address]:port
 	ENDPOINT_PORT="${ENDPOINT##*:}"
@@ -118,16 +121,16 @@ parse_conf() {
 	ENDPOINT_HOST="${ENDPOINT_HOST#[}"
 	ENDPOINT_HOST="${ENDPOINT_HOST%]}"
 	case "$ENDPOINT_PORT" in
-	'' | *[!0-9]*) die "cannot read the port of Endpoint '$ENDPOINT'" ;;
+	'' | *[!0-9]*) die "The Endpoint '$ENDPOINT' in this file has no port. It should look like vpn.example.com:51820." ;;
 	esac
-	[ -n "$ENDPOINT_HOST" ] || die "cannot read the host of Endpoint '$ENDPOINT'"
+	[ -n "$ENDPOINT_HOST" ] || die "The Endpoint '$ENDPOINT' in this file has no server name. It should look like vpn.example.com:51820."
 
 	# the watchdog pings from the tunnel's own IPv4 address
 	HAS_V4=0
 	for a in $(list_items "$ADDRESSES"); do
 		case "$a" in *:*) ;; *) HAS_V4=1 ;; esac
 	done
-	[ "$HAS_V4" = 1 ] || die "no IPv4 Address in [Interface]: the watchdog needs one to ping from"
+	[ "$HAS_V4" = 1 ] || die "This VPN gives the router no IPv4 address (Address in [Interface]), so it cannot be checked and cannot be used here."
 }
 
 is_profile() {
@@ -234,14 +237,14 @@ do_use() {
 	if [ "$1" = none ]; then
 		remove_tunnel
 		apply_changes
-		echo "No VPN: the house uses the ISP connection."
+		echo "VPN is off: all devices use the normal connection."
 		return 0
 	fi
 
-	is_profile "$1" || die "there is no VPN '$1'"
-	uci -q get network.wan >/dev/null || die "this router has no wan interface: this belongs on the main router"
-	uci -q get network.lan >/dev/null || die "this router has no lan interface"
-	[ -f /etc/config/firewall ] || die "no firewall configuration on this router"
+	is_profile "$1" || die "There is no VPN '$1'. It may have been deleted."
+	uci -q get network.wan >/dev/null || die "This router has no WAN interface. The VPN belongs on the main router, the one connected to the modem."
+	uci -q get network.lan >/dev/null || die "This router has no LAN interface."
+	[ -f /etc/config/firewall ] || die "This router has no firewall configuration."
 	parse_conf "$PROFILE_DIR/$1.conf"
 
 	# from here on the configuration is written: a failed step stops before the commit
@@ -250,7 +253,7 @@ do_use() {
 	write_tunnel
 	uci set "$CFG.active=$1"
 	apply_changes
-	echo "The house now uses $(profile_name "$PROFILE_DIR/$1.conf"), with fallback to the ISP connection."
+	echo "Connecting to $(profile_name "$PROFILE_DIR/$1.conf")."
 }
 
 do_add() {
@@ -268,7 +271,7 @@ do_add() {
 	# the kept file starts with the name, so the name is always there to read
 	mkdir -p "$PROFILE_DIR" && chmod 700 "$PROFILE_DIR" &&
 		(umask 077 && { echo "# Name = $name"; cat "$NEW_FILE"; } >"$PROFILE_DIR/$id.conf") ||
-		die "cannot keep the file in $PROFILE_DIR"
+		die "The file could not be saved in $PROFILE_DIR."
 	echo "Added $name."
 
 	# nothing in use yet: the first VPN is what the house uses
@@ -276,14 +279,15 @@ do_add() {
 }
 
 do_delete() {
-	is_profile "$1" || die "there is no VPN '$1'"
+	is_profile "$1" || die "There is no VPN '$1'. It may have been deleted already."
+	name="$(profile_name "$PROFILE_DIR/$1.conf")"
 	rm -f "$PROFILE_DIR/$1.conf"
 	# a VPN that is not in use is only its file: the one in use is left running
 	if [ "$(cfg active)" = "$1" ]; then
 		remove_tunnel
 		apply_changes
 	fi
-	echo "Deleted."
+	echo "Deleted $name."
 }
 
 # --- status --------------------------------------------------------------------------------------
@@ -408,7 +412,7 @@ do_run() {
 		*) [ -n "$PROBE_SRC" ] || PROBE_SRC="${a%/*}" ;;
 		esac
 	done
-	[ -n "$PROBE_SRC" ] || die "no VPN is in use"
+	[ -n "$PROBE_SRC" ] || die "No VPN is in use: there is nothing to watch."
 
 	DNS_V4=''
 	DNS_V6=''
