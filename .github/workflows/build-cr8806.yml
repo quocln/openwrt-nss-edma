@@ -146,7 +146,7 @@ jobs:
             echo "::error::USB or ext4 packages are in the image"; exit 1
           fi
           grep -q '^luci ' images/*.manifest || { echo "::error::LuCI is not in the image"; exit 1; }
-          for pkg in wpad-mesh-mbedtls kmod-qca-nss-drv-wifi-meshmgr kmod-wireguard wireguard-tools; do
+          for pkg in wpad-mesh-mbedtls kmod-qca-nss-drv-wifi-meshmgr kmod-wireguard wireguard-tools luci-app-vpn-failover; do
             grep -q "^${pkg} " images/*.manifest || { echo "::error::${pkg} is not in the image"; exit 1; }
           done
           if grep -q '^wpad-basic-mbedtls ' images/*.manifest; then
