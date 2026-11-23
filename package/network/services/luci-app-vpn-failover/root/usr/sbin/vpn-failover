@@ -13,8 +13,9 @@
 #   vpn-failover status          the VPNs and the state as JSON (read by the LuCI page VPN)
 #   vpn-failover run             the watchdog; /etc/init.d/vpn-failover starts it
 #
-# The devices that skip the VPN and the way the watchdog checks the tunnel are settings in
-# /etc/config/vpn-failover. The VPNs are their files, kept in /etc/vpn-failover as vpn<N>.conf.
+# The devices and websites that skip the VPN (or the websites that alone use it) and the way the
+# watchdog checks the tunnel are settings in /etc/config/vpn-failover. The VPNs are their files,
+# kept in /etc/vpn-failover as vpn<N>.conf.
 #
 # How it works:
 #   - Only the VPN in use has a tunnel, "wgvpn". It keeps its routes in a routing table of its
@@ -30,12 +31,23 @@
 #     normal servers again. "option vpn_dns '0'" keeps the normal servers all the time.
 #   - Devices that skip the VPN are matched by their LAN address, so each of them needs a fixed
 #     address (a static lease). They still ask the router for DNS like everybody else.
+#   - Websites: "option site_mode 'all'" sends everything through the VPN except the names in
+#     "list direct_site"; 'listed' sends only the names in "list vpn_site" through it. A name
+#     covers its sub-names. dnsmasq puts every address it finds for a listed name into an
+#     nftables set, packets from the LAN to those addresses get a mark, and the mark decides
+#     their route. So this needs a dnsmasq built with nftset (dnsmasq-full), and it works for
+#     devices that ask the router for names. With 'listed' the redirection of all DNS questions
+#     is left out: only the listed names are asked at the VPN's DNS server.
 #   - A VPN file without an IPv6 address: IPv6 from the LAN is refused while the tunnel is up,
 #     so nothing slips past the VPN over IPv6. Devices then simply use IPv4.
 
 IFACE=wgvpn
 TABLE=100                 # the tunnel's own routing table
 DNS_TABLE=vpn_failover    # the nftables table that redirects the router's DNS questions
+SITES_TABLE=vpn_failover_sites  # the nftables table with the addresses of the listed websites
+SITE_MARK=0x10000000      # the mark on packets from the LAN to a listed website
+NAMES_FILE=vpn-failover.conf    # what dnsmasq has to know about them, in its conf-dir
+SERVERS_FILE=.vpn-failover-servers  # there too; the dot keeps it from being read as configuration
 CFG=vpn-failover.main
 PROFILE_DIR=/etc/vpn-failover
 STATE_FILE=/var/run/vpn-failover.state
@@ -59,6 +71,11 @@ cfg() {
 list_items() {
 	# "a, b ,c" -> one item per line
 	echo "$1" | tr ',' '\n' | sed 's/^[ \t]*//; s/[ \t]*$//' | grep -v '^$' || true
+}
+
+has_nftset() {
+	# a dnsmasq without nftset would not start on a line that names a set
+	dnsmasq --version 2>/dev/null | grep -q ' nftset'
 }
 
 # --- the VPNs: add, use, delete -------------------------------------------------------------------
@@ -154,6 +171,12 @@ remove_tunnel() {
 	# The watchdog of the old tunnel goes first, so the state never names a VPN it is not
 	# watching; apply_changes starts the service again.
 	/etc/init.d/vpn-failover stop 2>/dev/null || true
+	# stopping takes a moment: what follows must not run next to the watchdog's own clean-up
+	n=0
+	while [ "$n" -lt 20 ] && [ -r "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; do
+		sleep 1
+		n=$((n + 1))
+	done
 	for item in "$CFG.active" "$CFG.dns" "network.$IFACE" "network.${IFACE}_peer" \
 		firewall.vpn_zone firewall.lan_to_vpn; do
 		uci -q delete "$item" || true
@@ -217,6 +240,7 @@ do_use() {
 	if [ "$1" = none ]; then
 		remove_tunnel
 		apply_changes
+		sites_off
 		echo "VPN is off: all devices use the normal connection."
 		return 0
 	fi
@@ -266,6 +290,7 @@ do_delete() {
 	if [ "$(cfg active)" = "$1" ]; then
 		remove_tunnel
 		apply_changes
+		sites_off
 	fi
 	echo "Deleted $name."
 }
@@ -291,6 +316,8 @@ do_status() {
 	# seconds since 1970 of the last handshake with the server, 0 for none yet
 	handshake="$(wg show "$IFACE" latest-handshakes 2>/dev/null | awk '{ print $2; exit }')"
 	json_add_int handshake "${handshake:-0}"
+	# whether this router's dnsmasq can route by website at all
+	if has_nftset; then json_add_boolean sites 1; else json_add_boolean sites 0; fi
 	json_add_array profiles
 	for CONF in "$PROFILE_DIR"/vpn*.conf; do
 		[ -f "$CONF" ] || continue
@@ -311,8 +338,9 @@ PRIO_PROBE=970       # the watchdog's own pings, always through the tunnel
 PRIO_PROBE_ONLY=971  # ... and nowhere else: see probe_rules
 PRIO_DIRECT=975      # devices that skip the VPN keep the normal route
 PRIO_DNS=980         # the VPN's DNS server is reached through the tunnel while it is up
+PRIO_SITE=985        # websites that skip the VPN keep the normal route
 PRIO_LOCAL=990       # private networks (the modem's page, other LANs) keep their normal route
-PRIO_LAN=1000        # everything else that comes in from the LAN
+PRIO_LAN=1000        # what else comes in from the LAN: all of it, or what goes to a listed website
 
 log() {
 	logger -s -t vpn-failover "$*"
@@ -342,15 +370,102 @@ steer() {
 	for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
 		rule 4 "$1" to "$n" lookup main priority "$PRIO_LOCAL"
 	done
-	rule 4 "$1" iif "$LAN_DEV" lookup "$TABLE" priority "$PRIO_LAN"
-
 	for n in fc00::/7 fe80::/10; do rule 6 "$1" to "$n" lookup main priority "$PRIO_LOCAL"; done
+
+	# $marked and $into_tunnel are not quoted on purpose: they are two words or none
+	marked="fwmark $SITE_MARK/$SITE_MARK"
+	if [ "$SITE_MODE" = listed ]; then
+		# only what goes to a listed website enters the tunnel
+		into_tunnel="$marked"
+	else
+		# everything enters the tunnel, except what goes to a listed website
+		into_tunnel=''
+		for f in 4 6; do rule "$f" "$1" $marked lookup main priority "$PRIO_SITE"; done
+	fi
+	rule 4 "$1" iif "$LAN_DEV" $into_tunnel lookup "$TABLE" priority "$PRIO_LAN"
 	if [ "$TUNNEL_V6" = 1 ]; then
-		rule 6 "$1" iif "$LAN_DEV" lookup "$TABLE" priority "$PRIO_LAN"
+		rule 6 "$1" iif "$LAN_DEV" $into_tunnel lookup "$TABLE" priority "$PRIO_LAN"
 	else
 		# the tunnel carries no IPv6: refuse it rather than let it pass around the VPN
-		rule 6 "$1" iif "$LAN_DEV" type prohibit priority "$PRIO_LAN"
+		rule 6 "$1" iif "$LAN_DEV" $into_tunnel type prohibit priority "$PRIO_LAN"
 	fi
+}
+
+site_names() {
+	# The names of the list in use, one per line. Only what can be a DNS name gets through:
+	# they end up in dnsmasq's configuration.
+	uci -q get "$CFG.$SITE_LIST" | tr ' A-Z' '\na-z' | grep -E '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' | sort -u
+}
+
+dnsmasq_confdir() {
+	# the folder the router's dnsmasq reads extra configuration from
+	sec="$(uci -X -q show dhcp | sed -n 's/^dhcp[.]\([^.=]*\)=dnsmasq$/\1/p' | head -n 1)"
+	[ -n "$sec" ] || return 1
+	dir="$(uci -q get "dhcp.$sec.confdir" || echo "/tmp/dnsmasq.$sec.d")"
+	dir="${dir%%,*}"
+	[ -d "$dir" ] && echo "$dir"
+}
+
+names_conf() {
+	# the lines for dnsmasq's configuration. One per name: dnsmasq reads no long lines.
+	site_names | sed "s|^.*$|nftset=/&/4#inet#$SITES_TABLE#listed4,6#inet#$SITES_TABLE#listed6|"
+	# a file of DNS servers for single names, which dnsmasq reads again on a SIGHUP: see dns_switch
+	[ "$SITE_MODE" = listed ] && [ -n "$VPN_DNS" ] && [ -n "$(site_names)" ] &&
+		echo "servers-file=$NAMES_DIR/$SERVERS_FILE"
+	return 0
+}
+
+sites_setup() {
+	# When the watchdog starts: dnsmasq's lines for the listed websites, the sets it fills with
+	# their addresses, and the mark on what the LAN sends to those. The mark does nothing without
+	# the rules of "steer". dnsmasq is restarted only when its lines changed, which takes a few
+	# seconds without DNS; the sets then start empty, their addresses were of the names of before.
+	NAMES_DIR="$(dnsmasq_confdir)" || NAMES_DIR=''
+	DNSMASQ_FRESH=''
+	if [ -n "$NAMES_DIR" ]; then
+		: >"$NAMES_DIR/$SERVERS_FILE"
+		new="$(names_conf)"
+		if [ "$new" != "$(cat "$NAMES_DIR/$NAMES_FILE" 2>/dev/null)" ]; then
+			rm -f "$NAMES_DIR/$NAMES_FILE"
+			nft delete table inet "$SITES_TABLE" 2>/dev/null
+			if [ -n "$new" ]; then
+				# lines dnsmasq does not take would leave the house without DNS and DHCP
+				echo "$new" >"/tmp/$NAMES_FILE.new"
+				if dnsmasq --test --conf-file="/tmp/$NAMES_FILE.new" >/dev/null 2>&1; then
+					mv "/tmp/$NAMES_FILE.new" "$NAMES_DIR/$NAMES_FILE"
+				else
+					rm -f "/tmp/$NAMES_FILE.new"
+					log "dnsmasq does not take the lines for the listed websites: they are routed like everything else"
+				fi
+			fi
+			DNSMASQ_FRESH=1
+		fi
+	fi
+	# nothing here disturbs a table that is there already, except the two rules made anew
+	nft -f - <<-EOF || log "the table for the listed websites could not be made: they are routed like everything else"
+		add table inet $SITES_TABLE
+		add set inet $SITES_TABLE listed4 { type ipv4_addr; }
+		add set inet $SITES_TABLE listed6 { type ipv6_addr; }
+		add chain inet $SITES_TABLE mark_listed { type filter hook prerouting priority mangle; policy accept; }
+		flush chain inet $SITES_TABLE mark_listed
+		add rule inet $SITES_TABLE mark_listed iifname "$LAN_DEV" ip daddr @listed4 meta mark set meta mark | $SITE_MARK
+		add rule inet $SITES_TABLE mark_listed iifname "$LAN_DEV" ip6 daddr @listed6 meta mark set meta mark | $SITE_MARK
+	EOF
+	[ -z "$DNSMASQ_FRESH" ] || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	return 0
+}
+
+sites_off() {
+	# No VPN in use any more: dnsmasq forgets the listed websites. For the commands, once the
+	# watchdog is gone; the watchdog itself leaves all this in place when it stops, so that
+	# starting it again costs no restart of dnsmasq.
+	nft delete table inet "$SITES_TABLE" 2>/dev/null
+	dir="$(dnsmasq_confdir)" || return 0
+	had=0
+	[ ! -e "$dir/$NAMES_FILE" ] || had=1
+	rm -f "$dir/$NAMES_FILE" "$dir/$SERVERS_FILE"
+	[ "$had" = 0 ] || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	return 0
 }
 
 dns_redirect() {
@@ -360,24 +475,42 @@ dns_redirect() {
 	# takes to be back on the normal servers. Questions over IPv6 are refused meanwhile: they
 	# cannot be rewritten to an IPv4 server, and dnsmasq then asks over IPv4.
 	nft delete table inet "$DNS_TABLE" 2>/dev/null
-	ACTIVE_DNS=''
-	if [ "$1" = add ] && [ -n "$VPN_DNS" ]; then
-		nft -f - <<-EOF && ACTIVE_DNS="$VPN_DNS"
-			table inet $DNS_TABLE {
-				chain to_vpn_dns {
-					type nat hook output priority -100; policy accept;
-					meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 fib daddr type != local dnat ip to $VPN_DNS
-				}
-				chain no_ipv6_dns {
-					type filter hook output priority 0; policy accept;
-					meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr type != local reject
-				}
+	[ "$1" = add ] || return 0
+	nft -f - <<-EOF
+		table inet $DNS_TABLE {
+			chain to_vpn_dns {
+				type nat hook output priority -100; policy accept;
+				meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 fib daddr type != local dnat ip to $VPN_DNS
 			}
-		EOF
-		[ -n "$ACTIVE_DNS" ] || log "the DNS questions could not be redirected to $VPN_DNS: the router keeps its normal DNS servers"
+			chain no_ipv6_dns {
+				type filter hook output priority 0; policy accept;
+				meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 fib daddr type != local reject
+			}
+		}
+	EOF
+}
+
+dns_switch() {
+	# dns_switch <up|down>: where names are looked up
+	dns_redirect del
+	ACTIVE_DNS=''
+	servers=''
+	if [ "$1" = up ] && [ -n "$VPN_DNS" ]; then
+		if [ "$SITE_MODE" = listed ]; then
+			# no redirection: only the listed names are asked at the VPN's DNS server
+			servers="$(site_names | sed "s|^.*$|server=/&/$VPN_DNS|")"
+			[ -z "$servers" ] || ACTIVE_DNS="$VPN_DNS"
+		elif dns_redirect add; then
+			ACTIVE_DNS="$VPN_DNS"
+		else
+			log "the DNS questions could not be redirected to $VPN_DNS: the router keeps its normal DNS servers"
+		fi
 	fi
-	# answers kept from the other servers would hide the change
-	killall -HUP dnsmasq 2>/dev/null
+	[ -z "$NAMES_DIR" ] || echo "$servers" >"$NAMES_DIR/$SERVERS_FILE"
+	# dnsmasq reads the servers again and drops the answers it kept, which would hide the change.
+	# Not right behind a restart: the signal would kill a dnsmasq that is still starting.
+	[ -n "$DNSMASQ_FRESH" ] || killall -HUP dnsmasq 2>/dev/null
+	DNSMASQ_FRESH=''
 	return 0
 }
 
@@ -406,9 +539,10 @@ set_state() {
 }
 
 stop_watchdog() {
-	dns_redirect del
+	# the routes first: they are what must not be left behind
 	steer del
 	probe_rules del
+	dns_switch down
 	forget_connections
 	rm -f "$STATE_FILE"
 	log "stopped: the house is on the ISP connection"
@@ -431,6 +565,20 @@ do_run() {
 	[ "$(cfg vpn_dns 1)" != 1 ] || VPN_DNS="$(cfg dns | cut -d ' ' -f 1)"
 	LAN_DEV="$(uci -q get network.lan.device || echo br-lan)"
 	DIRECT_IPS="$(cfg direct_ip)"
+	# what goes through the VPN: everything except the websites of one list, or only the
+	# websites of the other
+	SITE_MODE=all
+	SITE_LIST=direct_site
+	if [ "$(cfg site_mode all)" = listed ]; then
+		SITE_MODE=listed
+		SITE_LIST=vpn_site
+	fi
+	if ! has_nftset; then
+		[ "$SITE_MODE" = all ] && [ -z "$(site_names)" ] ||
+			log "this router's dnsmasq cannot route by website (it needs dnsmasq-full with nftset): the website lists are ignored and everything goes through the VPN"
+		SITE_MODE=all
+		SITE_LIST=no_site
+	fi
 	PROBE_TARGETS="$(cfg probe_target '1.1.1.1 8.8.8.8')"   # one answer is enough
 	INTERVAL="$(cfg interval 10)"       # seconds between two checks
 	DOWN_AFTER="$(cfg down_after 3)"    # failed checks in a row before the house falls back
@@ -440,7 +588,8 @@ do_run() {
 
 	probe_rules add
 	steer del
-	dns_redirect del
+	sites_setup
+	dns_switch down
 	set_state starting
 	good=0
 	bad=0
@@ -456,13 +605,13 @@ do_run() {
 		fi
 		if [ "$state" != up ] && [ "$good" -ge "$UP_AFTER" ]; then
 			steer add
-			dns_redirect add
+			dns_switch up
 			forget_connections
 			set_state up
 			log "the tunnel answers: the house goes through the VPN"
 		elif [ "$state" = up ] && [ "$bad" -ge "$DOWN_AFTER" ]; then
-			dns_redirect del
 			steer del
+			dns_switch down
 			forget_connections
 			set_state down
 			log "the tunnel does not answer: the house is back on the ISP connection"

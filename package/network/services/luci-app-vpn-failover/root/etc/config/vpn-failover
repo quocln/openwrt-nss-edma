@@ -12,6 +12,11 @@ config failover 'main'
 	option vpn_dns '1'
 	# LAN addresses of devices that always use the ISP connection:
 	# list direct_ip '192.168.7.50'
+	# all: everything goes through the VPN, except the websites in "list direct_site";
+	# listed: only the websites in "list vpn_site" go through it. A name covers its sub-names.
+	option site_mode 'all'
+	# list direct_site 'example.vn'
+	# list vpn_site 'example.com'
 
 # "option active" names the VPN in use, one of the files /etc/vpn-failover/vpn<N>.conf that
 # "vpn-failover add <file>" (or the LuCI page VPN, House VPN) keeps. Set by "vpn-failover use".

@@ -9,13 +9,19 @@
 #
 # In the image rather than installed afterwards: it needs kmod-wireguard, and a
 # kernel module has to come from the build that made the kernel.
+#
+# The website lists (which websites go through the VPN) need a dnsmasq built
+# with nftset, that is dnsmasq-full in place of the default dnsmasq. It is not
+# a dependency: selecting it next to the default one would put both into the
+# image. Without it the page says so and everything goes through the VPN.
 
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI page for a whole-house WireGuard VPN with fallback to the ISP connection
 LUCI_DESCRIPTION:=VPN -> House VPN: keeps several WireGuard client files and sends the LAN \
  through the chosen one while it answers pings, and over the ISP connection while it does \
- not. Devices on a list always use the ISP connection.
+ not. Devices on a list always use the ISP connection, and websites can be listed to \
+ skip the VPN or to be the only ones that use it (with dnsmasq-full).
 LUCI_DEPENDS:=+luci-base +luci-proto-wireguard +kmod-wireguard +wireguard-tools +ip-full +firewall4
 LUCI_PKGARCH:=all
 

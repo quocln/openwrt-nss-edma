@@ -104,6 +104,45 @@ function phaseOf(st) {
 	return 'connecting';
 }
 
+// what the settings send through the VPN: everything except the websites of one list, or only
+// the websites of the other; and how many names that list has
+function siteRules(st) {
+	var listed = (st.sites !== false && uci.get('vpn-failover', 'main', 'site_mode') === 'listed');
+
+	return {
+		listed: listed,
+		count: (st.sites === false) ? 0
+			: L.toArray(uci.get('vpn-failover', 'main', listed ? 'vpn_site' : 'direct_site')).length
+	};
+}
+
+// the banner's sentences about a connected VPN: what goes through it, and where names are looked up
+function routedText(st) {
+	var rules = siteRules(st);
+
+	if (rules.listed && !rules.count)
+		return _('No website is set to go through the VPN yet, so everything still uses the normal internet connection. Add websites under Settings → Websites.');
+
+	if (rules.listed)
+		return _('Only the websites on your list go through this VPN; everything else uses the normal internet connection.') + ' ' + (st.dns
+			? _('Their names are looked up at the VPN’s DNS server %s.').format(st.dns)
+			: _('Names are looked up at the router’s normal DNS servers.'));
+
+	return (rules.count
+		? _('All devices go through this VPN, except for the websites set to skip it.')
+		: _('All devices go through this VPN.')) + ' ' + (st.dns
+		? _('The router looks names up at the VPN’s DNS server %s.').format(st.dns)
+		: _('The router looks names up at its normal DNS servers.'));
+}
+
+// one entry of a website list: a bare name
+function validateSite(section_id, value) {
+	if (value === '' || (/^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$/i.test(value) && !/^www\./i.test(value)))
+		return true;
+
+	return _('Type only the name of the website, such as netflix.com: no https://, no www. and nothing after the name.');
+}
+
 // Names, addresses and error texts come from the router and from files the user gave it. E()
 // only builds text nodes for array members, so the brackets around them are load-bearing.
 function renderBanner(st) {
@@ -124,10 +163,7 @@ function renderBanner(st) {
 		break;
 	case 'up':
 		title = _('Connected to %s').format(name);
-		sub = (st.dns
-			? _('All devices go through this VPN, and the router looks names up at its DNS server %s.').format(st.dns)
-			: _('All devices go through this VPN. The router looks names up at its normal DNS servers.'))
-			+ ' ' + _('Connected for %s.').format(duration(st.now - st.since));
+		sub = routedText(st) + ' ' + _('Connected for %s.').format(duration(st.now - st.since));
 		break;
 	case 'down':
 		title = _('%s is not responding').format(name);
@@ -148,7 +184,9 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			getStatus(),
-			uci.load('dhcp')
+			uci.load('dhcp'),
+			// the banner says what the settings send through the VPN
+			uci.load('vpn-failover')
 		]);
 	},
 
@@ -386,6 +424,9 @@ return view.extend({
 		s.addremove = false;
 		s.tab('devices', _('Devices that skip the VPN'),
 			_('Devices listed here always use the normal internet connection, also while a VPN is connected. Useful for a device that does not work through a VPN.'));
+		s.tab('sites', _('Websites'), (st.sites === false)
+			? _('This router cannot choose by website: its DNS service was built without the part that is needed (the package dnsmasq-full, with nftset). Whatever is set here is ignored, and everything goes through the VPN.')
+			: _('Choose which websites go through the VPN. A website is given by its name, such as netflix.com; that also covers www.netflix.com and every other name ending in .netflix.com.'));
 		s.tab('dns', _('DNS'),
 			_('DNS turns names such as example.com into addresses. Devices ask the router, and the router asks a DNS server.'));
 		s.tab('advanced', _('Advanced'),
@@ -402,8 +443,30 @@ return view.extend({
 			});
 		});
 
+		o = s.taboption('sites', form.ListValue, 'site_mode', _('What goes through the VPN'));
+		o.value('all', _('Everything, except the websites listed below'));
+		o.value('listed', _('Only the websites listed below'));
+		o.default = 'all';
+		o.rmempty = false;
+		// two choices with long labels: both readable at once, which a drop-down cuts short
+		o.widget = 'radio';
+		o.orientation = 'vertical';
+
+		// one list per choice above; the other one is kept for when the choice changes back
+		[
+			[ 'all', 'direct_site', _('Websites that skip the VPN') ],
+			[ 'listed', 'vpn_site', _('Websites that go through the VPN') ]
+		].forEach(function(list) {
+			o = s.taboption('sites', form.DynamicList, list[1], list[2],
+				_('Large services use several names, and each one has to be listed: Netflix, for example, also uses nflxvideo.net. The list works for devices that ask the router for names, so not for a phone or browser set to “Private DNS” or “Secure DNS”. After a change, devices need a minute or two to follow.'));
+			o.depends('site_mode', list[0]);
+			o.retain = true;
+			o.placeholder = 'netflix.com';
+			o.validate = validateSite;
+		});
+
 		o = s.taboption('dns', form.Flag, 'vpn_dns', _('Use the DNS server of the VPN'),
-			_('On: while a VPN is connected, the router asks the DNS server named in that VPN’s file, through the VPN. Off: the router keeps asking its normal DNS servers, so your internet provider can still see which names are looked up. While no VPN is connected the router always uses its normal DNS servers.'));
+			_('On: while a VPN is connected, the router asks the DNS server named in that VPN’s file, through the VPN. Off: the router keeps asking its normal DNS servers, so your internet provider can still see which names are looked up. While no VPN is connected the router always uses its normal DNS servers. If only listed websites go through the VPN, only their names are asked at the VPN’s DNS server.'));
 		o.default = '1';
 		o.rmempty = false;
 
